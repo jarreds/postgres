@@ -119,7 +119,7 @@ maybe_send_keepalive(void)
 }
 
 static void
-handle_keepalive(char *copybuf, int copylen)
+handle_keepalive(void *copybuf, size_t copylen)
 {
 	/* the server may want a reply */
 	bool replyRequested;
@@ -127,21 +127,28 @@ handle_keepalive(char *copybuf, int copylen)
 	/* the end of the wal on the server */
 	XLogRecPtr walEnd;
 
-	/* grab the wal end position */
-	walEnd = fe_recvint64(&copybuf[1]);
-
-	/* TODO check walEnd against our output_written_lsn to check if we're
-	 * behind or whatever */
+	/* make sure we have a keepalive payload */
+	if (copybuf == NULL)
+	{
+		errorf("Empty keepalive received\n");
+		fail_fast();
+	}
 
 	/* double-check that the size is correct */
 	if (copylen < 18)
 	{
-		errorf("Streaming header too small: %d\n", copylen);
+		errorf("Streaming header too small: %zu\n", copylen);
 		fail_fast();
 	}
 
+	/* grab the wal end position */
+	walEnd = fe_recvint64(&((char*) copybuf)[1]);
+
+	/* TODO check walEnd against our output_written_lsn to check if we're
+	 * behind or whatever */
+
 	/* read if the server wants a reply */
-	replyRequested = copybuf[17];
+	replyRequested = ((char*) copybuf)[17];
 
 	/* if the server requested an immediate reply, send one. */
 	if (replyRequested)
@@ -155,12 +162,34 @@ handle_keepalive(char *copybuf, int copylen)
 }
 
 static void
-kafka_callback(int err, void *copybuf)
+kafka_callback(int err, void *copybuf, size_t copylen)
 {
 	/* check if we had a delivery failure */
 	if (err)
 	{
 		errorf("Received %d sending to kafka\n", err);
+		fail_fast();
+	}
+
+	/* make sure we have a callback payload */
+	if (copybuf == NULL)
+	{
+		errorf("Empty callback received\n");
+		fail_fast();
+	}
+
+	/* double-check that the size is correct
+	 * 25 == msgtype 'w' + dataStart + walEnd + sendTime */
+	if (copylen <= 25)
+	{
+		errorf("Callback header too small: %zu\n", copylen);
+		fail_fast();
+	}
+
+	/* double-check that we have the correct message type */
+	if (((char*) copybuf)[0] != 'w')
+	{
+		errorf("Unrecognized callback header: \"%c\"\n", ((char*) copybuf)[0]);
 		fail_fast();
 	}
 
@@ -354,7 +383,7 @@ consume_replication_stream(void)
 			break;
 
 		/* failure while reading the copy stream */
-		if (copylen == -2)
+		if (copylen <= -2)
 		{
 			errorf("Could not read copy data: %s", PQerrorMessage(conn));
 			fail_fast();
@@ -397,7 +426,7 @@ consume_replication_stream(void)
 		 * the kafka lib will make a callback with the full payload when the
 		 * msg is sent or fails */
 		ret = kafka_send_msg(copybuf + hdrlen, copylen - hdrlen, NULL, 0,
-							 copybuf, kafka_callback);
+							 copybuf, copylen, kafka_callback);
 		if (ret < 0)
 		{
 			errorf("Could not send to kafka: %d\n", ret);

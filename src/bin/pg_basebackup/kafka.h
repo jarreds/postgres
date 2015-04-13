@@ -11,5 +11,5 @@ extern void kafka_destroy(void);
 extern int kafka_poll(void);
 extern int kafka_send_msg(void *payload, size_t paylen,
 						  void *key, size_t keylen,
-						  void *msg_opaque,
-						  void (*cb) (int err, void *opaque));
+						  void *msg_opaque, size_t msg_opaquelen,
+						  void (*cb) (int err, void *opaque, size_t opaquelen));

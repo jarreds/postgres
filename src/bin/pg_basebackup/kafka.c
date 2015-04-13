@@ -28,7 +28,8 @@ struct message_struct {
 	enum status stat;
 	int err;
 	void *ref;
-	void (*cb) (int err, void *ref);
+	size_t reflen;
+	void (*cb) (int err, void *ref, size_t reflen);
 	STAILQ_ENTRY(message_struct) entries;
 };
 
@@ -49,7 +50,7 @@ kafka_send_msg_fifo_cb(void)
 		STAILQ_REMOVE_HEAD(&head, entries);
 
 		/* make the callback to the calling code */
-		first->cb(first->err, first->ref);
+		first->cb(first->err, first->ref, first->reflen);
 
 		/* release the internal fifo queue tracking entry */
 		free(first);
@@ -76,8 +77,8 @@ kafka_poll(void)
 int
 kafka_send_msg(void *payload, size_t paylen,
 			   void *key, size_t keylen,
-			   void *msg_opaque,
-			   void (*cb) (int err, void *opaque))
+			   void *msg_opaque, size_t msg_opaquelen,
+			   void (*cb) (int err, void *opaque, size_t opaquelen))
 {
 	int res;
 
@@ -86,6 +87,7 @@ kafka_send_msg(void *payload, size_t paylen,
 	msg->stat = PENDING; /* it's pending */
 	msg->err = 0; /* no error yet */
 	msg->ref = msg_opaque; /* extra data used for caller tracking */
+	msg->reflen = msg_opaquelen; /* extra data length */
 	msg->cb = cb; /* callback that we call on delivery or fail */
 
 	/* send the msg to librdkafka for async delivery */
