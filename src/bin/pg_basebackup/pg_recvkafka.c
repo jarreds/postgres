@@ -153,12 +153,67 @@ handle_keepalive(void *copybuf, size_t copylen)
 	/* if the server requested an immediate reply, send one. */
 	if (replyRequested)
 	{
-		/* poll kafka, so we send a recent flush pointer */
-		kafka_poll();
-
 		/* tell the server our status */
 		send_keepalive(true, false);
 	}
+}
+
+static void
+kafka_checkpoint_callback(int err, void *checkpoint, size_t checkpointlen)
+{
+	/* check if we had a delivery failure */
+	if (err)
+	{
+		errorf("Received %d sending checkpoint to kafka\n", err);
+		fail_fast();
+	}
+
+	/* double-check that the size is correct */
+	if (checkpointlen != 9)
+	{
+		errorf("Checkpoint payload too small: %zu\n", checkpointlen);
+		fail_fast();
+	}
+
+	/* all we care about is that the checkpoint was written, so free */
+	free(checkpoint);
+}
+
+static void
+kafka_checkpoint(void)
+{
+	int ret;
+
+	/* keep track of the last checkpoint we sent */
+	static XLogRecPtr last_checkpoint_lsn = InvalidXLogRecPtr;
+
+	/* we're treating this kafka stream as a write ahead log
+	 * so checkpoint it at the last known successful lsn */
+	char *checkpoint;
+
+	/* only send checkpoints if the "fsync'd" lsn has changed */
+	if (last_checkpoint_lsn >= output_fsync_lsn)
+	{
+		return;
+	}
+
+	/* use the format 'C########') */
+	checkpoint = malloc(9);
+	checkpoint[0] = 'C';
+	fe_sendint64(output_fsync_lsn, checkpoint + 1);
+
+	/* try to send the checkpoint to kafka */
+	ret = kafka_send_msg(checkpoint, 9,
+						 checkpoint + 1, 8, /* lsn */
+						 checkpoint, 9);
+	if (ret < 0)
+	{
+		errorf("Could not send checkpoint to kafka: %d\n", ret);
+		fail_fast();
+	}
+
+	/* record that we attempted to send this checkpoint */
+	last_checkpoint_lsn = output_fsync_lsn;
 }
 
 static void
@@ -198,6 +253,82 @@ kafka_callback(int err, void *copybuf, size_t copylen)
 
 	/* and cleanup the now unused mem */
 	PQfreemem(copybuf);
+}
+
+static void
+kafka_read_msg_delivery_pipe(void)
+{
+	/* the kafka lib writes delivered/failed messages to a pipe
+	 * this is where we read them */
+
+	/* the kafka message we're currently processing */
+	kafka_msg *msg = NULL;
+
+	/* keep track of how many messages we've read */
+	int msg_count = 0;
+
+	/* number of bytes to read from pipe per msg */
+	int bytes_to_read = sizeof(msg);
+
+	/* keep track of how much data we've read per read */
+	int bytes_read = 0;
+
+	/* keep track of how much data we've read per msg */
+	int bytes_total_read = 0;
+
+	/* read messages off the pipe until there's nothing left */
+	while ((bytes_read = read(kafka_msg_delivery_pipe,
+							  &msg + bytes_total_read,
+							  bytes_to_read - bytes_total_read)) > 0)
+	{
+		/* keep track of how much we've read in total for this msg */
+		bytes_total_read += bytes_read;
+
+		/* ensure we've read the entire msg, or read more */
+		if (bytes_total_read < bytes_to_read)
+			continue;
+		/* we've read the entire message, reset and continue */
+		else if (bytes_total_read == bytes_to_read)
+			bytes_total_read = 0;
+		/* something is off, we've read more than we should
+		 * this really should not happen */
+		else
+		{
+			errorf("Pipe overrun: %d\n", bytes_total_read);
+			fail_fast();
+		}
+
+		/* keep track of how many msgs we've received */
+		msg_count++;
+
+		/* size 9 is a checkpoint msg */
+		if (msg->reflen == 9)
+			kafka_checkpoint_callback(msg->err, msg->ref, msg->reflen);
+		/* or else it's a legit copydata msg */
+		else
+			kafka_callback(msg->err, msg->ref, msg->reflen);
+
+		/* the msg is no longer used so set it free */
+		free(msg);
+	}
+
+	/* if this isn't an non-blocking error, something is wrong */
+	if (bytes_read < 0 && errno != EAGAIN)
+	{
+		errorf("Pipe read failed: %s\n", strerror(errno));
+		fail_fast();
+	}
+
+	/* we haven't read an entire msg, but there is nothing left on the pipe */
+	if (bytes_total_read > 0)
+	{
+		errorf("Pipe has torn data: %d\n", bytes_total_read);
+		fail_fast();
+	}
+
+	/* if we processed a msg(s), send a checkpoint */
+	if (msg_count > 0)
+		kafka_checkpoint();
 }
 
 static void
@@ -288,9 +419,10 @@ wait_replication_stream(void)
 	/* this is how select() tracks timeout */
 	struct timeval timeout;
 
-	/* we're going to watch the pg connection for incoming io */
+	/* watch the pg connection and kafka deliv pipe for incoming io */
 	FD_ZERO(&read_fds);
 	FD_SET(PQsocket(conn), &read_fds);
+	FD_SET(kafka_msg_delivery_pipe, &read_fds);
 
 	/* compute when we need to wakeup to send a keepalive message
 	 * offset by one ms to make sure we hit the keepalive target */
@@ -311,7 +443,8 @@ wait_replication_stream(void)
 	timeout.tv_usec = usecs;
 
 	/* block until we a) receive io or b) timeout */
-	ret = select(PQsocket(conn) + 1, &read_fds, NULL, NULL, &timeout);
+	ret = select(Max(PQsocket(conn), kafka_msg_delivery_pipe) + 1,
+				 &read_fds, NULL, NULL, &timeout);
 
 	/* zero means success, -1 and EINTR mean the timeout hit */
 	if (ret == 0 || (ret < 0 && errno == EINTR))
@@ -328,7 +461,7 @@ wait_replication_stream(void)
 	/* we actually have some data */
 	else
 	{
-		/* this a behinds the scene call that just reads data so another
+		/* this a behinds the scene call that reads data so another
 		 * select won't block */
 		if (PQconsumeInput(conn) == 0)
 		{
@@ -346,7 +479,14 @@ consume_replication_stream(void)
 
 	/* the copybuf is the current streamed log entry */
 	char *copybuf = NULL;
-	int copylen, hdrlen;
+	int copylen;
+
+	/* read the header of the XLogData message, enclosed in the CopyData
+	 * message.
+	 * we only need the WAL location field (dataStart), so the rest of the
+	 * header is ignored.
+	 * 25 == msgtype 'w' + dataStart + walEnd + sendTime */
+	int hdrlen = 25;
 
 	/* we haven't written anything yet, so */
 	output_written_lsn = InvalidXLogRecPtr;
@@ -359,8 +499,8 @@ consume_replication_stream(void)
 		if (copybuf != NULL)
 			copybuf = NULL;
 
-		/* poll kafka to make sure callbacks are up to date */
-		kafka_poll();
+		/* check if we've had any msg deliveries */
+		kafka_read_msg_delivery_pipe();
 
 		/* send a keepalive if we need to */
 		maybe_send_keepalive();
@@ -408,13 +548,6 @@ consume_replication_stream(void)
 			fail_fast();
 		}
 
-		/* read the header of the XLogData message, enclosed in the CopyData
-		 * message.
-		 * we only need the WAL location field (dataStart), so the rest of the
-		 * header is ignored.
-		 * 25 == msgtype 'w' + dataStart + walEnd + sendTime */
-		hdrlen = 25;
-
 		/* double-check everything is legit */
 		if (copylen < hdrlen + 1)
 		{
@@ -425,8 +558,9 @@ consume_replication_stream(void)
 		/* send the message body to kafka.
 		 * the kafka lib will make a callback with the full payload when the
 		 * msg is sent or fails */
-		ret = kafka_send_msg(copybuf + hdrlen, copylen - hdrlen, NULL, 0,
-							 copybuf, copylen, kafka_callback);
+		ret = kafka_send_msg(copybuf + hdrlen, copylen - hdrlen,
+							 copybuf + 1, 8, /* lsn */
+							 copybuf, copylen);
 		if (ret < 0)
 		{
 			errorf("Could not send to kafka: %d\n", ret);
@@ -570,13 +704,6 @@ main(int argc, char **argv)
 	/* start up the replication stream from pg */
 	start_replication_streaming();
 
-	/* until we're killed or error */
-	while (true)
-	{
-		consume_replication_stream();
-
-		/* we were ctrl-c'd, exit */
-		if (time_to_abort)
-			fail_fast();
-	}
+	/* consume until we're killed or error */
+	consume_replication_stream();
 }

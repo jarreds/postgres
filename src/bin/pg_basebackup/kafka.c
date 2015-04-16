@@ -1,12 +1,18 @@
 #include <stdlib.h>
 #include <sys/queue.h>
+#include <pthread.h>
+#include <fcntl.h>
 #include <unistd.h>
+#include <signal.h>
+#include <errno.h>
+#include <string.h>
 
 #include "kafka.h"
 
 /* let whoever set these */
 char *kafka_brokers;
 char *kafka_topic;
+int kafka_msg_delivery_pipe;
 
 /* right now, we send everything to the same partition */
 static int partition = 0;
@@ -17,23 +23,17 @@ static rd_kafka_conf_t *conf = NULL;
 static rd_kafka_topic_t *rkt = NULL;
 static rd_kafka_topic_conf_t *topic_conf = NULL;
 
-/* a message can be in one of these states */
-enum status { PENDING, DELIVERED, FAIL };
+/* use these to communicate with the caller */
+static pthread_t msg_cb_poller = NULL;
+static int msg_cb_pipes[2];
+
+/* to break our separate thread polling loop */
+static volatile sig_atomic_t time_to_abort = 0;
 
 /* librdkafka sends messages async with callbacks -- in order to guarantee
  * callback ordering we place all requests in a fifo queue and callback in the
  * correct order */
-typedef struct message_struct message;
-struct message_struct {
-	enum status stat;
-	int err;
-	void *ref;
-	size_t reflen;
-	void (*cb) (int err, void *ref, size_t reflen);
-	STAILQ_ENTRY(message_struct) entries;
-};
-
-STAILQ_HEAD(fifo, message_struct) head = STAILQ_HEAD_INITIALIZER(head);
+STAILQ_HEAD(fifo, kafka_msg_struct) head = STAILQ_HEAD_INITIALIZER(head);
 
 /* enforce that our delivery callbacks are made in the same order the msgs
  * were produced -- we need this to replicate the wal log correctly */
@@ -41,54 +41,101 @@ static void
 kafka_send_msg_fifo_cb(void)
 {
 	/* the head of the fifo queue */
-	message *first = NULL;
+	kafka_msg *first = NULL;
+
+	/* number of bytes we're going to write to the pipe */
+	int bytes_to_write = sizeof(first);
+
+	/* how many bytes we've written per write */
+	int bytes_written = 0;
+
+	/* how many bytes we've written per msg */
+	int bytes_total_written = 0;
 
 	/* iterate the fifo queue for non-pending msgs and callback on those */
-	while ((first = STAILQ_FIRST(&head)) && first->stat != PENDING)
+	while ((first = STAILQ_FIRST(&head)) && first->status != PENDING)
 	{
 		/* remove the msg from the queue */
 		STAILQ_REMOVE_HEAD(&head, entries);
 
-		/* make the callback to the calling code */
-		first->cb(first->err, first->ref, first->reflen);
+		/* loop until we've written everything to the pipe */
+		while ((bytes_written = write(msg_cb_pipes[1],
+									  &first + bytes_total_written,
+									  bytes_to_write - bytes_total_written)) >= 0)
+		{
+			/* keep track of how much we've written in total for this msg */
+			bytes_total_written += bytes_written;
 
-		/* release the internal fifo queue tracking entry */
-		free(first);
+			/* ensure we've written the entire msg, or write more */
+			if (bytes_total_written < bytes_to_write)
+				continue;
+			/* we've written the entire msg, reset and break */
+			else if (bytes_total_written == bytes_to_write)
+			{
+				bytes_total_written = 0;
+				break;
+			}
+		}
+
+		/* something broke */
+		if (bytes_written < 0)
+		{
+			errorf("Pipe write failed: %s\n", strerror(errno));
+			exit(1);
+		}
+		/* we didn't write everything */
+		else if (bytes_total_written > 0)
+		{
+			errorf("Pipe write incomplete: %d\n", bytes_total_written);
+			fail_fast();
+		}
 	}
 }
 
 void
 kafka_destroy(void)
 {
+	/* kill the poll loop */
+	time_to_abort = 1;
+
 	if (rkt)
 		rd_kafka_topic_destroy(rkt);
 
 	if (rk)
 		rd_kafka_destroy(rk);
+
+	/* make sure the poll loop is dead */
+	pthread_join(msg_cb_poller, NULL);
+
+	/* cleanup the pipe */
+	close(msg_cb_pipes[0]);
+	close(msg_cb_pipes[1]);
 }
 
-int
-kafka_poll(void)
+static void*
+kafka_poll_loop(void *arg)
 {
-	/* we call this initiate delivery callbacks */
-	return rd_kafka_poll(rk, 0);
+	/* do what we do to check for deliveries */
+	while (!time_to_abort)
+		if (rd_kafka_poll(rk, 1000) > 0)
+			kafka_send_msg_fifo_cb();
+
+	return NULL;
 }
 
 int
 kafka_send_msg(void *payload, size_t paylen,
 			   void *key, size_t keylen,
-			   void *msg_opaque, size_t msg_opaquelen,
-			   void (*cb) (int err, void *opaque, size_t opaquelen))
+			   void *msg_opaque, size_t msg_opaquelen)
 {
 	int res;
 
 	/* wrap the msg in a tracking structure for our fifo queue */
-	message *msg = malloc(sizeof(message));
-	msg->stat = PENDING; /* it's pending */
+	kafka_msg *msg = malloc(sizeof(kafka_msg));
+	msg->status = PENDING; /* it's pending */
 	msg->err = 0; /* no error yet */
 	msg->ref = msg_opaque; /* extra data used for caller tracking */
 	msg->reflen = msg_opaquelen; /* extra data length */
-	msg->cb = cb; /* callback that we call on delivery or fail */
 
 	/* send the msg to librdkafka for async delivery */
 	res = rd_kafka_produce(rkt, partition, 0,
@@ -122,12 +169,12 @@ kafka_send_msg_cb(rd_kafka_t *rk,
 				  void *opaque, void *msg_opaque)
 {
 	/* extra data that the caller is using for tracking */
-	message *msg = (message*)msg_opaque;
+	kafka_msg *msg = (kafka_msg*)msg_opaque;
 
 	if (err)
 	{
 		/* welp, mark the message as fail */
-		msg->stat = FAIL;
+		msg->status = FAIL;
 		errorf("Failed to produce to topic %s partition %i: %s\n",
 			   rd_kafka_topic_name(rkt), partition,
 			   rd_kafka_err2str(rd_kafka_errno2err(err)));
@@ -135,14 +182,11 @@ kafka_send_msg_cb(rd_kafka_t *rk,
 	else
 	{
 		/* it's all good */
-		msg->stat = DELIVERED;
+		msg->status = DELIVERED;
 	}
 
 	/* maybe an err, maybe not -- just pass it through */
 	msg->err = err;
-
-	/* initiate an fifo ordered callback to the calling code */
-	kafka_send_msg_fifo_cb();
 }
 
 int
@@ -159,6 +203,22 @@ kafka_init(void)
 	rd_kafka_conf_set_dr_cb(conf, kafka_send_msg_cb);
 
 	res = rd_kafka_conf_set(conf, "compression.codec", "snappy",
+							errstr, sizeof(errstr));
+	if (res != RD_KAFKA_CONF_OK)
+	{
+		errorf("%s\n", errstr);
+		exit(1);
+	}
+
+	res = rd_kafka_conf_set(conf, "queue.buffering.max.ms", "25",
+							errstr, sizeof(errstr));
+	if (res != RD_KAFKA_CONF_OK)
+	{
+		errorf("%s\n", errstr);
+		exit(1);
+	}
+
+	res = rd_kafka_conf_set(conf, "queue.buffering.max.messages", "100000",
 							errstr, sizeof(errstr));
 	if (res != RD_KAFKA_CONF_OK)
 	{
@@ -191,5 +251,22 @@ kafka_init(void)
 		exit(1);
 	}
 
-	return res;
+	res = pipe(msg_cb_pipes);
+	if (res == -1)
+	{
+		errorf("Could not create msg polling pipe: %d\n", res);
+		exit(1);
+	}
+
+	kafka_msg_delivery_pipe = msg_cb_pipes[0];
+	fcntl(kafka_msg_delivery_pipe, F_SETFL, O_NONBLOCK);
+
+	res = pthread_create(&msg_cb_poller, NULL, kafka_poll_loop, NULL);
+	if (res)
+	{
+		errorf("Could not create msg polling thread: %d\n", res);
+		exit(1);
+	}
+
+	return 1;
 }
