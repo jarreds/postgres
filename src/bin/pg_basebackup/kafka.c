@@ -81,13 +81,13 @@ kafka_send_msg_fifo_cb(void)
 		if (bytes_written < 0)
 		{
 			errorf("Pipe write failed: %s\n", strerror(errno));
-			exit(1);
+			kill(getpid(), SIGINT);
 		}
 		/* we didn't write everything */
 		else if (bytes_total_written > 0)
 		{
 			errorf("Pipe write incomplete: %d\n", bytes_total_written);
-			fail_fast();
+			kill(getpid(), SIGINT);
 		}
 	}
 }
