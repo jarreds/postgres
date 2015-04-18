@@ -13,10 +13,6 @@
 #include "pqexpbuffer.h"
 #include "kafka.h"
 
-/* this is the logical decoding plugin that pg uses to output streaming wal
- * data -- can set via cmd line params */
-static const char *plugin = "test_decoding";
-
 /* pg requires that we send keepalives, it also requests us to send them,
  * these variables keep track of how often we keepalive and the last time we
  * did */
@@ -203,7 +199,7 @@ kafka_checkpoint(void)
 	fe_sendint64(output_fsync_lsn, checkpoint + 1);
 
 	/* try to send the checkpoint to kafka */
-	ret = kafka_send_msg(checkpoint, 9,
+	ret = kafka_send_msg(checkpoint, 1,
 						 checkpoint + 1, 8, /* lsn */
 						 checkpoint, 9);
 	if (ret < 0)
@@ -629,7 +625,6 @@ main(int argc, char **argv)
 		{"brokers", required_argument, NULL, 'b'},
 		{"output_start_lsn", required_argument, NULL, 'I'},
 		{"option", required_argument, NULL, 'o'},
-		{"plugin", required_argument, NULL, 'P'},
 		{"status-interval", required_argument, NULL, 's'},
 		{"slot", required_argument, NULL, 'S'},
 		{NULL, 0, NULL, 0}
@@ -638,7 +633,7 @@ main(int argc, char **argv)
 	int c;
 	int option_index;
 
-	while ((c = getopt_long(argc, argv, "f:F:nvd:h:p:U:wWI:o:P:s:S:t:b:",
+	while ((c = getopt_long(argc, argv, "f:F:nvd:h:p:U:wWI:o:s:S:t:b:",
 							long_options, &option_index)) != -1)
 	{
 		switch (c)
@@ -669,9 +664,6 @@ main(int argc, char **argv)
 				break;
 			case 'o':
 				parse_replication_options(optarg);
-				break;
-			case 'P':
-				plugin = pg_strdup(optarg);
 				break;
 			case 's':
 				keepalive_interval_us = atoi(optarg) * ((int64) 1000000);
