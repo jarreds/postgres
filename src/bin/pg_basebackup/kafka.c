@@ -189,6 +189,15 @@ kafka_send_msg_cb(rd_kafka_t *rk,
 	msg->err = err;
 }
 
+static void
+kafka_error_cb(rd_kafka_t *rk,
+			   int err, const char *reason,
+			   void *opaque)
+{
+	errorf("Kafka error: %s: %s\n", rd_kafka_err2str(err), reason);
+	kill(getpid(), SIGINT);
+}
+
 int
 kafka_init(void)
 {
@@ -200,6 +209,7 @@ kafka_init(void)
 	conf = rd_kafka_conf_new();
 	topic_conf = rd_kafka_topic_conf_new();
 
+	rd_kafka_conf_set_error_cb(conf, kafka_error_cb);
 	rd_kafka_conf_set_dr_cb(conf, kafka_send_msg_cb);
 
 	res = rd_kafka_conf_set(conf, "compression.codec", "snappy",
