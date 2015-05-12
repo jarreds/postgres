@@ -130,6 +130,11 @@ kafka_send_msg(void *payload, size_t paylen,
 {
 	int res;
 
+	/* if we fill the librbkafka send buffer we apply 1ms backpressure */
+	struct timeval backpressure;
+	backpressure.tv_sec = 0;
+	backpressure.tv_usec = 1000;
+
 	/* wrap the msg in a tracking structure for our fifo queue */
 	kafka_msg *msg = malloc(sizeof(kafka_msg));
 	msg->status = PENDING; /* it's pending */
@@ -138,10 +143,20 @@ kafka_send_msg(void *payload, size_t paylen,
 	msg->reflen = msg_opaquelen; /* extra data length */
 
 	/* send the msg to librdkafka for async delivery */
-	res = rd_kafka_produce(rkt, partition, 0,
-						   payload, paylen,
-						   key, keylen,
-						   msg);
+	while ((res = rd_kafka_produce(rkt, partition, 0,
+								   payload, paylen,
+								   key, keylen,
+								   msg)) == -1 &&
+		   errno == ENOBUFS)
+	{
+		/* don't spin if we're aborting*/
+		if (time_to_abort) return res;
+
+		fprintf(stderr, "Applying kafka send backpressure\n");
+
+		/* apply backpressure for 1 ms when we've queued too many msgs */
+		select(0, NULL, NULL, NULL, &backpressure);
+	}
 
 	if (res == -1)
 	{
