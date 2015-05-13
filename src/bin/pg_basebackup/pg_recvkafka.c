@@ -140,8 +140,8 @@ handle_keepalive(void *copybuf, size_t copylen)
 	/* grab the wal end position */
 	walEnd = fe_recvint64(&((char*) copybuf)[1]);
 
-	/* TODO check walEnd against our output_written_lsn to check if we're
-	 * behind or whatever */
+	/* grab the wal end position */
+	output_written_lsn = Max(walEnd, output_written_lsn);
 
 	/* read if the server wants a reply */
 	replyRequested = ((char*) copybuf)[17];
