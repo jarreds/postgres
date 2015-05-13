@@ -251,9 +251,6 @@ kafka_init(void)
 		exit(1);
 	}
 
-	/* rd_kafka_set_logger(rk, rk_logger); */
-	/* rd_kafka_set_log_level(rk, LOG_INFO); */
-
 	rk = rd_kafka_new(RD_KAFKA_PRODUCER, conf,
 					  errstr, sizeof(errstr));
 	if (!rk)
