@@ -47,7 +47,7 @@ fail_fast()
 }
 
 static void
-send_keepalive(bool force, bool replyRequested)
+send_keepalive(bool force)
 {
 	/* constant now() so server and client timestamps equal */
 	int64 now = feGetCurrentTimestamp();
@@ -84,7 +84,7 @@ send_keepalive(bool force, bool replyRequested)
 	len += 8;
 	fe_sendint64(now, &replybuf[len]); /* sendTime */
 	len += 8;
-	replybuf[len] = replyRequested ? 1 : 0; /* replyRequested */
+	replybuf[len] = false; /* replyRequested */
 	len += 1;
 
 	/* track the lsns we told the server about */
@@ -107,10 +107,10 @@ static void
 maybe_send_keepalive(void)
 {
 	/* if we're past our keepalive interval, send a keepalive */
-	if (feGetCurrentTimestamp() - last_keepalive_us >= keepalive_interval_us)
+	if ((feGetCurrentTimestamp() - last_keepalive_us) >= keepalive_interval_us)
 	{
 		/* send it */
-		send_keepalive(true, false);
+		send_keepalive(true);
 	}
 }
 
@@ -150,7 +150,7 @@ handle_keepalive(void *copybuf, size_t copylen)
 	if (replyRequested)
 	{
 		/* tell the server our status */
-		send_keepalive(true, false);
+		send_keepalive(true);
 	}
 }
 
