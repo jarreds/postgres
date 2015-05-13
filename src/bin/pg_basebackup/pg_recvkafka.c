@@ -516,7 +516,10 @@ consume_replication_stream(void)
 
 		/* end of copy stream, so start exiting */
 		if (copylen == -1)
-			break;
+		{
+			errorf("Connection closed\n");
+			fail_fast();
+		}
 
 		/* failure while reading the copy stream */
 		if (copylen <= -2)
