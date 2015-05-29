@@ -22,7 +22,7 @@ override LDFLAGS := -lrdkafka -lz -lpthread $(LDFLAGS)
 
 OBJS=receivelog.o streamutil.o kafka.o $(WIN32RES)
 
-all: pg_basebackup pg_receivexlog pg_recvlogical pg_recvkafka
+all: pg_basebackup pg_receivexlog pg_recvlogical pg_kafka
 
 pg_basebackup: pg_basebackup.o $(OBJS) | submake-libpq submake-libpgport
 	$(CC) $(CFLAGS) pg_basebackup.o $(OBJS) $(libpq_pgport) $(LDFLAGS) $(LDFLAGS_EX) $(LIBS) -o $@$(X)
@@ -33,14 +33,14 @@ pg_receivexlog: pg_receivexlog.o $(OBJS) | submake-libpq submake-libpgport
 pg_recvlogical: pg_recvlogical.o $(OBJS) | submake-libpq submake-libpgport
 	$(CC) $(CFLAGS) pg_recvlogical.o $(OBJS) $(libpq_pgport) $(LDFLAGS) $(LDFLAGS_EX) $(LIBS) -o $@$(X)
 
-pg_recvkafka: pg_recvkafka.o $(OBJS) | submake-libpq submake-libpgport
-	$(CC) $(CFLAGS) pg_recvkafka.o $(OBJS) $(libpq_pgport) $(LDFLAGS)  $(LDFLAGS_EX) $(LIBS) -o $@$(X)
+pg_kafka: pg_kafka.o $(OBJS) | submake-libpq submake-libpgport
+	$(CC) $(CFLAGS) pg_kafka.o $(OBJS) $(libpq_pgport) $(LDFLAGS)  $(LDFLAGS_EX) $(LIBS) -o $@$(X)
 
 install: all installdirs
 	$(INSTALL_PROGRAM) pg_basebackup$(X) '$(DESTDIR)$(bindir)/pg_basebackup$(X)'
 	$(INSTALL_PROGRAM) pg_receivexlog$(X) '$(DESTDIR)$(bindir)/pg_receivexlog$(X)'
 	$(INSTALL_PROGRAM) pg_recvlogical$(X) '$(DESTDIR)$(bindir)/pg_recvlogical$(X)'
-	$(INSTALL_PROGRAM) pg_recvkafka$(X) '$(DESTDIR)$(bindir)/pg_recvkafka$(X)'
+	$(INSTALL_PROGRAM) pg_kafka$(X) '$(DESTDIR)$(bindir)/pg_kafka$(X)'
 
 installdirs:
 	$(MKDIR_P) '$(DESTDIR)$(bindir)'
@@ -49,12 +49,12 @@ uninstall:
 	rm -f '$(DESTDIR)$(bindir)/pg_basebackup$(X)'
 	rm -f '$(DESTDIR)$(bindir)/pg_receivexlog$(X)'
 	rm -f '$(DESTDIR)$(bindir)/pg_recvlogical$(X)'
-	rm -f '$(DESTDIR)$(bindir)/pg_recvkafka$(X)'
+	rm -f '$(DESTDIR)$(bindir)/pg_kafka$(X)'
 
 clean distclean maintainer-clean:
 	rm -f pg_basebackup$(X) pg_receivexlog$(X) pg_recvlogical$(X) \
 		pg_basebackup.o pg_receivexlog.o \
-		pg_recvkafka$(X) pg_recvkafka.o kafka.o \
+		pg_kafka$(X) pg_kafka.o kafka.o \
 		$(OBJS)
 	rm -rf tmp_check
 
